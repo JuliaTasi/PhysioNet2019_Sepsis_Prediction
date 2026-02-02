@@ -65,6 +65,12 @@ coverage.xml
 *.swp
 *.swo
 
+# Virtual environment
+.venv/
+
+# Experiment results
+/results/
+
 # Other
 .shastore
 

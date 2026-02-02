@@ -115,7 +115,7 @@ if __name__ == '__main__':
 
     # Some things to save
     binary_labels = torch.Tensor(df['SepsisLabel'].values)
-    utility_scores = torch.Tensor(scores['utility'])
+    utility_scores = torch.Tensor(scores['utility'].values)
 
     # Create a time-series dataset
     print('Step 3 of 3: Converting to TimeSeriesDataset format.')

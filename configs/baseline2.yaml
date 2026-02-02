@@ -1,0 +1,7 @@
+baseline: 2
+data_path: data/processed/experiment
+output_dir: results
+external_ratio: 0.5
+downsample_rate: 8
+impute_method: saits
+seed: 42

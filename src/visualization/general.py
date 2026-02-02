@@ -22,7 +22,7 @@ def missing_values_barplot(df, missing=True, return_vals=False):
 
     # Barplot it
     fig, ax = plt.subplots(figsize=(12, 5))
-    sns.barplot(s_amount.index, s_amount.values, ax=ax, palette="Blues_d")
+    sns.barplot(x=s_amount.index, y=s_amount.values, ax=ax, palette="Blues_d")
 
     # Some niceties
     ax.set_title('% {} values'.format('Missing' if missing else 'Contained'), weight='bold', fontsize=16)
