@@ -4,6 +4,10 @@ convert_data.py
 Converts the raw .psv files downloaded in src/data/get_data/download.py into a dataframe useful for analysis.
 Further, this converts the binary 0-1 labels to the corresponding utility score.
 """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
 from definitions import *
 import numpy as np
 import torch
@@ -106,7 +110,7 @@ if __name__ == '__main__':
     # Create a dataframe
     print('Step 1 of 3: Converting to pandas dataframe.')
     df = load_to_dataframe()
-    save_pickle(df, DATA_DIR + '/raw/df.pickle')
+    save_pickle(df, DATA_DIR + '/processed/df.pickle')
 
     # Convert the scores
     print('Step 2 of 3: Converting to labels.')
@@ -114,16 +118,16 @@ if __name__ == '__main__':
     scores = convert_labels(df)
 
     # Some things to save
-    binary_labels = torch.Tensor(df['SepsisLabel'].values)
-    utility_scores = torch.Tensor(scores['utility'].values)
+    binary_labels = torch.Tensor(df['SepsisLabel'].values.copy()) 
+    utility_scores = torch.Tensor(scores['utility'].values.copy())
 
     # Create a time-series dataset
     print('Step 3 of 3: Converting to TimeSeriesDataset format.')
     dataset = create_timeseries_dataset(df)
 
     # Save the data
-    save_pickle(scores, DATA_DIR + '/processed/labels/full_scores.pickle')
-    save_pickle(utility_scores, DATA_DIR + '/processed/labels/utility_scores.pickle')
-    save_pickle(binary_labels, DATA_DIR + '/processed/labels/binary.pickle')
-    save_pickle(overall_labels, DATA_DIR + '/processed/labels/overall_labels.pickle')
-    dataset.save(DATA_DIR + '/raw/data.tsd')
+    save_pickle(scores, DATA_DIR + '/processed/full_scores.pickle')
+    save_pickle(utility_scores, DATA_DIR + '/processed/utility_scores.pickle')
+    save_pickle(binary_labels, DATA_DIR + '/processed/binary.pickle')
+    save_pickle(overall_labels, DATA_DIR + '/processed/overall_labels.pickle')
+    dataset.save(DATA_DIR + '/processed/data.tsd')

@@ -43,8 +43,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run baseline imputation experiments for sepsis prediction.")
     parser.add_argument("--config", type=str, default=None,
                         help="Path to YAML config file. CLI args override config values.")
-    parser.add_argument("--baseline", type=int, choices=[1, 2, 3, 4],
-                        help="Which baseline to run (1/2/3/4)")
+    parser.add_argument("--baseline", type=str, choices=["1", "2-1", "2-2", "3-1", "3-2", "4"],
+                        help="Which baseline to run (1/2-1/2-2/3-1/3-2/4)")
     parser.add_argument("--data_path", type=str, default=None,
                         help="Path to experiment data (relative to project root)")
     parser.add_argument("--output_dir", type=str, default=None,
@@ -59,6 +59,8 @@ def parse_args():
                         help="Similarity metric for baseline 3")
     parser.add_argument("--top_k", type=int, default=None,
                         help="Number of similar patients for weighted avg (baseline 3)")
+    parser.add_argument("--n_clusters", type=int, default=None,
+                        help="Number of clusters for baseline 3 (default 20)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
 
     args = parser.parse_args()
@@ -66,13 +68,14 @@ def parse_args():
     # Defaults
     defaults = dict(
         baseline=None,
-        data_path="data/processed/experiment",
+        data_path="data/experiment",
         output_dir="results",
         external_ratio=0.5,
         downsample_rate=8,
         impute_method="saits",
         similarity_metric="soft_dtw",
         top_k=5,
+        n_clusters=50,
         seed=42,
     )
 
@@ -124,7 +127,7 @@ def add_expert_features(dataset):
 def save_results(output_dir, baseline, metrics, clf=None, imputation_model=None, args=None):
     """Save performance metrics, RF classifier, and optional imputation model."""
     output_dir = resolve_path(output_dir)
-    baseline_dir = os.path.join(output_dir, f"baseline_{baseline}")
+    baseline_dir = os.path.join(output_dir, f"baseline_{baseline}_full")
     os.makedirs(baseline_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -241,10 +244,10 @@ def train_and_evaluate(train_dataset, train_labels, test_dataset, test_labels, s
 
 def load_data(data_dir):
     """Load train internal, train external, and test datasets + labels."""
-    train_int = TimeSeriesDataset().load(data_dir + '/train_internal.tsd')
-    labels_train_int = load_pickle(data_dir + '/labels_train_internal.pickle')
-    test = TimeSeriesDataset().load(data_dir + '/test.tsd')
-    labels_test = load_pickle(data_dir + '/labels_test.pickle')
+    train_int = TimeSeriesDataset().load(data_dir + '/train_internal_full.tsd')
+    labels_train_int = load_pickle(data_dir + '/labels_train_internal_full.pickle')
+    test = TimeSeriesDataset().load(data_dir + '/test_full.tsd')
+    labels_test = load_pickle(data_dir + '/labels_test_full.pickle')
     return train_int, labels_train_int, test, labels_test
 
 
@@ -317,9 +320,72 @@ def run_baseline_1(args):
 # ============================================================================
 # Baseline 2: SAITS imputation (pypots)
 # ============================================================================
-def run_baseline_2(args):
+def _find_latest_saits_model(saits_dir):
+    """Find the latest trained SAITS model under the saving directory."""
+    saits_dir = resolve_path(saits_dir)
+    if not os.path.isdir(saits_dir):
+        return None
+    # Each run creates a timestamped subdirectory containing SAITS.pypots
+    subdirs = sorted(
+        [d for d in os.listdir(saits_dir)
+         if os.path.isfile(os.path.join(saits_dir, d, "SAITS.pypots"))],
+    )
+    if not subdirs:
+        return None
+    return os.path.join(saits_dir, subdirs[-1])
+
+
+def run_baseline_2_1(args):
     print("=" * 60)
-    print(f"Baseline 2: {args.impute_method.upper()} imputation")
+    print("Baseline 2-1: Linear interpolation imputation (per patient)")
+    print("=" * 60)
+
+    data_dir = resolve_path(args.data_path)
+    train_ds, train_labels, test_ds, test_labels = load_data(data_dir)
+    print(f"Train: {len(train_ds)} patients, Test: {len(test_ds)} patients")
+
+    # Upsample to 1hr resolution
+    print("Upsampling train to 1hr resolution...")
+    train_up = upsample_to_1hr(train_ds, downsample_rate=args.downsample_rate)
+    print("Upsampling test to 1hr resolution...")
+    test_up = upsample_to_1hr(test_ds, downsample_rate=args.downsample_rate)
+
+    def linear_impute_dataset(dataset):
+        """Per-patient, per-column linear interpolation. Edges extrapolated flat by np.interp."""
+        data_list = dataset.to_list()
+        for i in range(len(data_list)):
+            arr = data_list[i].numpy()  # [L, C]
+            for c in range(arr.shape[1]):
+                col = arr[:, c]
+                nans = np.isnan(col)
+                if nans.all() or (~nans).all():
+                    continue
+                idx = np.where(~nans)[0]
+                arr[:, c] = np.interp(np.arange(len(col)), idx, col[idx])
+            data_list[i] = torch.tensor(arr, dtype=torch.float32)
+        dataset_out = TimeSeriesDataset(data_list, list(dataset.columns))
+        dataset_out.lengths = dataset.lengths
+        return dataset_out
+
+    print("Imputing train data with linear interpolation...")
+    train_up = linear_impute_dataset(train_up)
+    print("Imputing test data with linear interpolation...")
+    test_up = linear_impute_dataset(test_up)
+
+    # Expert features + evaluate
+    train_up = add_expert_features(train_up)
+    test_up = add_expert_features(test_up)
+
+    train_labels_up = upsample_labels(train_labels, train_ds.lengths, args.downsample_rate)
+    test_labels_up = upsample_labels(test_labels, test_ds.lengths, args.downsample_rate)
+
+    clf, metrics = train_and_evaluate(train_up, train_labels_up, test_up, test_labels_up, seed=args.seed)
+    save_results(args.output_dir, baseline="2-1", metrics=metrics, clf=clf, args=args)
+
+
+def run_baseline_2_2(args):
+    print("=" * 60)
+    print(f"Baseline 2-2: {args.impute_method.upper()} imputation")
     print("=" * 60)
     from pypots.imputation import SAITS
     from pygrinder import mcar
@@ -351,41 +417,67 @@ def run_baseline_2(args):
         pad = np.full((test_np.shape[0], max_L - test_L, n_features), np.nan)
         test_np = np.concatenate([test_np, pad], axis=1)
 
-    # 1. Train/val split for SAITS training
-    print("Splitting train into train/val for SAITS (80/20)...")
-    saits_train, saits_val = train_test_split(train_np, test_size=0.2, random_state=args.seed)
-    print(f"SAITS train: {saits_train.shape[0]}, SAITS val: {saits_val.shape[0]}")
-    # 2. For validation set, keep original as X_ori and create artificially masked version
-    saits_val_ori = saits_val.copy()
+    # Check for existing trained model
+    saits_save_dir = os.path.join(args.output_dir, "baseline_2", "saits")
+    existing_model_dir = _find_latest_saits_model(saits_save_dir)
 
-    # Artificially mask some additional observed values (e.g., 10% more)
-    saits_val_masked = mcar(saits_val_ori, p=0.1)
-    
-    train_set = {"X": saits_train}
-    val_set = {
-        "X": saits_val_masked,      # Data with artificial + natural missing values
-        "X_ori": saits_val_ori      # Original data (with only natural missing values)
-    }
+    if existing_model_dir is not None:
+        model_path = os.path.join(existing_model_dir, "SAITS.pypots")
+        print(f"Found existing SAITS model: {model_path}")
+        print("Loading pre-trained model (skipping training)...")
+        saits = SAITS(
+            n_steps=max_L,
+            n_features=n_features,
+            n_layers=2,
+            d_model=256,
+            n_heads=4,
+            d_k=64,
+            d_v=64,
+            d_ffn=128,
+            dropout=0.1,
+            epochs=50,
+            patience=5,
+            batch_size=16,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
+        saits.load(model_path)
+    else:
+        # 1. Train/val split for SAITS training
+        print("No existing model found. Training from scratch...")
+        print("Splitting train into train/val for SAITS (80/20)...")
+        saits_train, saits_val = train_test_split(train_np, test_size=0.2, random_state=args.seed)
+        print(f"SAITS train: {saits_train.shape[0]}, SAITS val: {saits_val.shape[0]}")
+        # 2. For validation set, keep original as X_ori and create artificially masked version
+        saits_val_ori = saits_val.copy()
 
-    print("Training SAITS model...")
-    saits = SAITS(
-        n_steps=max_L,
-        n_features=n_features,
-        n_layers=2,
-        d_model=256,
-        n_heads=4,
-        d_k=64,
-        d_v=64,
-        d_ffn=128,
-        dropout=0.1,
-        epochs=50,
-        patience=5,
-        batch_size=32,
-        saving_path=resolve_path(os.path.join(args.output_dir, "baseline_2", "saits")),
-        device="cuda" if torch.cuda.is_available() else "cpu",
-    )
-    print(f"SAITS device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
-    saits.fit(train_set, val_set)
+        # Artificially mask some additional observed values (e.g., 10% more)
+        saits_val_masked = mcar(saits_val_ori, p=0.1)
+
+        train_set = {"X": saits_train}
+        val_set = {
+            "X": saits_val_masked,      # Data with artificial + natural missing values
+            "X_ori": saits_val_ori      # Original data (with only natural missing values)
+        }
+
+        print("Training SAITS model...")
+        saits = SAITS(
+            n_steps=max_L,
+            n_features=n_features,
+            n_layers=2,
+            d_model=256,
+            n_heads=4,
+            d_k=64,
+            d_v=64,
+            d_ffn=128,
+            dropout=0.1,
+            epochs=50,
+            patience=5,
+            batch_size=16,
+            saving_path=resolve_path(os.path.join(args.output_dir, "baseline_2", "saits")),
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
+        print(f"SAITS device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
+        saits.fit(train_set, val_set)
 
     # Impute train
     print("Imputing train data...")
@@ -410,19 +502,22 @@ def run_baseline_2(args):
     test_labels_up = upsample_labels(test_labels, test_ds.lengths, args.downsample_rate)
 
     clf, metrics = train_and_evaluate(train_up, train_labels_up, test_up, test_labels_up, seed=args.seed)
-    save_results(args.output_dir, baseline=2, metrics=metrics, clf=clf,
+    save_results(args.output_dir, baseline="2-2", metrics=metrics, clf=clf,
                  imputation_model=saits, args=args)
 
 
 # ============================================================================
-# Baseline 3: Soft-DTW similarity imputation
+# Baseline 3-1: Statistical-feature Euclidean similarity imputation
 # ============================================================================
-def run_baseline_3(args):
+def run_baseline_3_1(args):
     print("=" * 60)
-    print(f"Baseline 3: {args.similarity_metric} similarity imputation (top_k={args.top_k})")
+    print(f"Baseline 3-1: Euclidean feature-space similarity imputation (top_k={args.top_k})")
     print("=" * 60)
-    from tslearn.metrics import soft_dtw as compute_soft_dtw
+    from sklearn.cluster import MiniBatchKMeans
+    from sklearn.preprocessing import StandardScaler
+    from scipy.spatial.distance import euclidean
 
+    n_clusters = getattr(args, 'n_clusters', 20)
     data_dir = resolve_path(args.data_path)
 
     train_ds, train_labels, test_ds, test_labels = load_data(data_dir)
@@ -436,16 +531,53 @@ def run_baseline_3(args):
     shared_cols = [c for c in train_ds.columns if c in train_ext.columns]
     print(f"Shared columns: {len(shared_cols)}")
 
-    # Extract external patients as list of numpy arrays (original lengths)
+    # Extract external patients as list of numpy arrays (shared cols + full)
     ext_list = train_ext.subset(shared_cols).to_list()
-    ext_np = [t.numpy() for t in ext_list]
-
-    # Pre-extract full external patients to avoid repeated to_list() calls
+    ext_np = [np.nan_to_num(t.numpy(), nan=0.0) for t in ext_list]
     ext_full_list = train_ext.to_list()
     ext_full_np = [t.numpy() for t in ext_full_list]
 
+    # --- Extract statistical features for clustering ---
+    def extract_features(ts_list):
+        """Compute per-channel statistics (mean, std, min, max, length) as a
+        fixed-length feature vector regardless of time-series length."""
+        n_cols = ts_list[0].shape[1] if len(ts_list) > 0 else 0
+        # 4 stats per channel + 1 length feature
+        feat_dim = n_cols * 4 + 1
+        features = np.zeros((len(ts_list), feat_dim), dtype=np.float32)
+        for i, ts in enumerate(ts_list):
+            ts_clean = np.nan_to_num(ts, nan=0.0)
+            if len(ts_clean) == 0:
+                continue
+            offset = 0
+            features[i, offset:offset + n_cols] = ts_clean.mean(axis=0)
+            offset += n_cols
+            features[i, offset:offset + n_cols] = ts_clean.std(axis=0)
+            offset += n_cols
+            features[i, offset:offset + n_cols] = ts_clean.min(axis=0)
+            offset += n_cols
+            features[i, offset:offset + n_cols] = ts_clean.max(axis=0)
+            offset += n_cols
+            features[i, offset] = len(ts_clean)
+        return features
+
+    features_ext = extract_features(ext_np)
+
+    # --- Cluster external patients with MiniBatchKMeans ---
+    print(f"Clustering {len(ext_np)} external patients into {n_clusters} clusters...")
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features_ext)
+    kmeans = MiniBatchKMeans(n_clusters=n_clusters, batch_size=1000, random_state=args.seed)
+    ext_cluster_labels = kmeans.fit_predict(features_scaled)
+
+    # Build per-cluster index of external patients
+    cluster_to_ext_idx = {c: [] for c in range(n_clusters)}
+    for idx, cl in enumerate(ext_cluster_labels):
+        cluster_to_ext_idx[cl].append(idx)
+    print("Cluster sizes:", {c: len(v) for c, v in cluster_to_ext_idx.items()})
+
     def impute_with_external(internal_ds, downsample_rate, top_k):
-        """For each internal patient, find top-K similar external patients and fill missing."""
+        """For each internal patient, assign to nearest cluster then find top-K within that cluster."""
         int_shared = internal_ds.subset(shared_cols)
         int_list = int_shared.to_list()
 
@@ -462,32 +594,33 @@ def run_baseline_3(args):
 
             patient_obs = int_list[i].numpy()  # [L_coarse, C_shared]
 
-            # Remove rows that are entirely NaN for distance computation
             valid_mask = ~np.isnan(patient_obs).all(axis=1)
             patient_valid = patient_obs[valid_mask]
             if len(patient_valid) == 0:
                 continue
 
-            # Replace remaining NaN with 0 for distance computation
             patient_clean = np.nan_to_num(patient_valid, nan=0.0)
 
-            # Compute distance to each external patient
-            distances = []
-            for j, ext_p in enumerate(ext_np):
-                ext_valid = ~np.isnan(ext_p).all(axis=1)
-                ext_clean = np.nan_to_num(ext_p[ext_valid], nan=0.0)
-                if len(ext_clean) == 0:
-                    distances.append(float('inf'))
-                    continue
-                try:
-                    d = compute_soft_dtw(patient_clean, ext_clean, gamma=1.0)
-                    distances.append(d)
-                except Exception:
-                    distances.append(float('inf'))
+            # Extract features, scale, and predict cluster
+            patient_feat = extract_features([patient_clean])
+            patient_feat_scaled = scaler.transform(patient_feat)
+            cluster_id = kmeans.predict(patient_feat_scaled)[0]
+            candidate_indices = cluster_to_ext_idx[cluster_id]
 
-            distances = np.array(distances)
-            top_k_idx = np.argsort(distances)[:top_k]
-            top_k_dists = distances[top_k_idx]
+            if len(candidate_indices) == 0:
+                continue
+
+            # Compute Euclidean distance in feature space within the assigned cluster
+            patient_vec = patient_feat_scaled[0]
+            distances = np.array([
+                euclidean(patient_vec, features_scaled[ext_idx])
+                for ext_idx in candidate_indices
+            ])
+
+            n_select = min(top_k, len(candidate_indices))
+            local_top_k = np.argsort(distances)[:n_select]
+            top_k_idx = [candidate_indices[li] for li in local_top_k]
+            top_k_dists = distances[local_top_k]
 
             # Compute weights (inverse distance)
             top_k_dists = np.maximum(top_k_dists, 1e-8)
@@ -533,7 +666,143 @@ def run_baseline_3(args):
     test_labels_up = upsample_labels(test_labels, test_ds.lengths, args.downsample_rate)
 
     clf, metrics = train_and_evaluate(train_imputed, train_labels_up, test_imputed, test_labels_up, seed=args.seed)
-    save_results(args.output_dir, baseline=3, metrics=metrics, clf=clf, args=args)
+    save_results(args.output_dir, baseline="3-1", metrics=metrics, clf=clf, args=args)
+
+
+# ============================================================================
+# Baseline 3-2: Pearson-correlation similarity imputation (coarse scale)
+# ============================================================================
+def run_baseline_3_2(args):
+    print("=" * 60)
+    print(f"Baseline 3-2: Pearson-correlation similarity imputation (top_k={args.top_k})")
+    print("=" * 60)
+
+    data_dir = resolve_path(args.data_path)
+    downsample_rate = args.downsample_rate
+    top_k = args.top_k
+
+    train_ds, train_labels, test_ds, test_labels = load_data(data_dir)
+    train_ext = TimeSeriesDataset().load(data_dir + '/train_external.tsd')
+
+    print(f"Train internal: {len(train_ds)} patients")
+    print(f"Train external: {len(train_ext)} patients")
+    print(f"Test:           {len(test_ds)} patients")
+
+    # Get shared columns between internal and external
+    shared_cols = [c for c in train_ds.columns if c in train_ext.columns]
+    print(f"Shared columns: {len(shared_cols)}")
+
+    # External patients: keep NaNs for mask-based correlation
+    ext_shared_list = train_ext.subset(shared_cols).to_list()
+    ext_shared_np = [t.numpy() for t in ext_shared_list]       # raw with NaNs
+    ext_full_list = train_ext.to_list()
+    ext_full_np = [t.numpy() for t in ext_full_list]
+
+    # Downsample external to coarse scale (take every downsample_rate-th row)
+    ext_coarse = []
+    for ts in ext_shared_np:
+        ext_coarse.append(ts[::downsample_rate])  # [L_ext_coarse, C_shared]
+    print(f"Downsampled external to coarse scale (rate={downsample_rate})")
+
+    def pearson_corr_distance(a, b):
+        """Pearson correlation distance between two 2D arrays.
+        Only uses positions where both a and b are non-NaN."""
+        a_flat = a.flatten()
+        b_flat = b.flatten()
+        valid = ~(np.isnan(a_flat) | np.isnan(b_flat))
+        if valid.sum() < 2:
+            return float('inf')
+        a_v = a_flat[valid]
+        b_v = b_flat[valid]
+        corr = np.corrcoef(a_v, b_v)[0, 1]
+        if np.isnan(corr):
+            return float('inf')
+        return 1.0 - corr  # distance: 0 = perfect correlation, 2 = perfect anti-correlation
+
+    def impute_with_external(internal_ds, downsample_rate, top_k):
+        """For each internal patient, find top-K external by Pearson correlation at coarse scale."""
+        int_shared = internal_ds.subset(shared_cols)
+        int_list = int_shared.to_list()
+
+        # Upsample internal to 1hr
+        upsampled_ds = upsample_to_1hr(internal_ds, downsample_rate)
+        up_data = upsampled_ds.to_list()
+
+        col_idx_map = {c: upsampled_ds.columns.index(c) for c in shared_cols}
+        ext_col_idx_map = {c: train_ext.columns.index(c) for c in shared_cols}
+
+        for i in range(len(int_list)):
+            if i % 20 == 0:
+                print(f"  Processing patient {i+1}/{len(int_list)}...")
+
+            patient_obs = int_list[i].numpy()  # [L_coarse, C_shared], has NaNs
+
+            # Check patient has some valid data
+            if np.isnan(patient_obs).all():
+                continue
+
+            # Compute Pearson correlation distance to all external (at coarse scale)
+            distances = np.empty(len(ext_coarse))
+            for j, ec in enumerate(ext_coarse):
+                # Align lengths: use min of both
+                L_min = min(len(patient_obs), len(ec))
+                distances[j] = pearson_corr_distance(patient_obs[:L_min], ec[:L_min])
+
+            # Select top-k most correlated
+            n_select = min(top_k, len(ext_coarse))
+            top_k_local = np.argsort(distances)[:n_select]
+            top_k_dists = distances[top_k_local]
+
+            # Skip if no valid correlations found
+            if top_k_dists[0] == float('inf'):
+                continue
+
+            # Compute weights (inverse distance)
+            top_k_dists = np.maximum(top_k_dists, 1e-8)
+            weights = 1.0 / top_k_dists
+            weights = weights / weights.sum()
+
+            # Get upsampled patient tensor
+            patient_up = up_data[i].numpy()  # [L_up, C_all]
+            new_L = patient_up.shape[0]
+
+            for k_i, ext_idx in enumerate(top_k_local):
+                ext_full = ext_full_np[ext_idx]  # [L_ext, C_ext]
+
+                for c in shared_cols:
+                    up_col = col_idx_map[c]
+                    ext_col = ext_col_idx_map[c]
+                    for t in range(min(new_L, len(ext_full))):
+                        if np.isnan(patient_up[t, up_col]) and not np.isnan(ext_full[t, ext_col]):
+                            if k_i == 0:
+                                patient_up[t, up_col] = 0.0
+                            patient_up[t, up_col] += weights[k_i] * ext_full[t, ext_col]
+
+            up_data[i] = torch.tensor(patient_up, dtype=torch.float32)
+
+        # Rebuild dataset
+        new_lengths = [t.shape[0] for t in up_data]
+        new_ds = TimeSeriesDataset(up_data, list(upsampled_ds.columns))
+        new_ds.lengths = new_lengths
+        return new_ds
+
+    print("Imputing train internal with external data...")
+    train_imputed = impute_with_external(train_ds, downsample_rate, top_k)
+
+    print("Imputing test with external data...")
+    test_imputed = impute_with_external(test_ds, downsample_rate, top_k)
+
+    # Expert features
+    train_imputed = add_expert_features(train_imputed)
+    test_imputed = add_expert_features(test_imputed)
+
+    # Expand labels
+    train_labels_up = upsample_labels(train_labels, train_ds.lengths, downsample_rate)
+    test_labels_up = upsample_labels(test_labels, test_ds.lengths, downsample_rate)
+
+    clf, metrics = train_and_evaluate(train_imputed, train_labels_up, test_imputed, test_labels_up, seed=args.seed)
+    save_results(args.output_dir, baseline="3-2", metrics=metrics, clf=clf, args=args)
+
 
 
 # ============================================================================
@@ -551,13 +820,15 @@ def main():
     set_seed(args.seed)
 
     runners = {
-        1: run_baseline_1,
-        2: run_baseline_2,
-        3: run_baseline_3,
-        4: run_baseline_4,
+        "1": run_baseline_1,
+        "2-1": run_baseline_2_1,
+        "2-2": run_baseline_2_2,
+        "3-1": run_baseline_3_1,
+        "3-2": run_baseline_3_2,
+        "4": run_baseline_4,
     }
 
-    runners[args.baseline](args)
+    runners[str(args.baseline)](args)
 
 
 if __name__ == "__main__":

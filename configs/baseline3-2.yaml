@@ -1,0 +1,8 @@
+baseline: "3-2" # Pearson-correlation similarity imputation (coarse scale)
+data_path: data/experiment
+output_dir: results
+external_ratio: 0.5
+downsample_rate: 8
+similarity_metric: pearson_corr
+top_k: 5
+seed: 42

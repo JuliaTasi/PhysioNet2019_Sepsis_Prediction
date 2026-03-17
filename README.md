@@ -19,3 +19,40 @@ Run the following:
 You are then ready to go! Check `/notebooks/examples/prediction.ipynb` for an intro to the basic prediction methods and the functions used to generate the features. Then either follow the example and use a notebook to build your own models, or do something similar to that seen in ``src/model/examples/train_{MODEL_TYPE}.py``. 
 
 More functionality will be added soon!
+
+Repository Structure
+--------------------
+```
+PhysioNet2019_Sepsis_Prediction/
+├── configs/
+├── data/
+│   ├── experiment/
+│   ├── processed/
+│   │   └── labels/
+│   └── raw/
+│       ├── training_setA/
+│       └── training_setB/
+├── notebooks/
+│   └── examples/
+├── results/
+│   ├── baseline_1/
+│   ├── baseline_1_full/
+│   ├── baseline_2-1/
+│   ├── baseline_2-1_full/
+│   ├── baseline_2-2/
+│   │   └── saits/
+│   ├── baseline_3-1/
+│   └── baseline_3-2/
+└── src/
+    ├── data/
+    │   └── get_data/
+    ├── experiments/
+    ├── external/
+    │   └── example_solution/
+    ├── features/
+    │   └── signatures/
+    ├── model/
+    │   └── examples/
+    ├── omni/
+    └── visualization/
+```
