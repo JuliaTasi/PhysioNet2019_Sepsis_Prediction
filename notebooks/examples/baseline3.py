@@ -40,6 +40,8 @@ class _Tee:
 
 _log_dir = os.path.join(os.path.dirname(__file__), '../../results')
 os.makedirs(_log_dir, exist_ok=True)
+SAITS_MODEL_DIR = os.path.join(_log_dir, 'saits_models')
+os.makedirs(SAITS_MODEL_DIR, exist_ok=True)
 _log_path = os.path.join(_log_dir, 'baseline3_output.txt')
 _log_file = open(_log_path, 'w')
 sys.stdout = _Tee(sys.__stdout__, _log_file)
@@ -76,6 +78,8 @@ SAITS_PARAMS = dict(
     batch_size=16,
 )
 
+DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
 print("=" * 60)
 print("Baseline 3: SAITS at 1hr + Pearson similarity external fusion")
 print("=" * 60)
@@ -84,7 +88,7 @@ print(f"Downsample rate:  {DOWNSAMPLE_RATE}hr")
 print(f"Top-K:            {TOP_K}")
 print(f"Fusion weight:    {FUSION_WEIGHT} internal / {1.0 - FUSION_WEIGHT} external")
 print(f"SAITS parameters: {SAITS_PARAMS}")
-print(f"Device:           {'cpu'}")
+print(f"Device:           {DEVICE}")
 print()
 
 np.random.seed(SEED)
@@ -177,7 +181,7 @@ def train_saits(data_np, seed, tag=""):
     model = SAITS(
         n_steps=max_L,
         n_features=n_features,
-        device="cpu",
+        device=DEVICE,
         **SAITS_PARAMS,
     )
     model.fit(train_set, val_set)
@@ -201,6 +205,7 @@ def impute_with_saits(model, data_np, original_L):
 train_internal = TimeSeriesDataset().load(DATA_PATH + '/train_internal.tsd')
 train_external = TimeSeriesDataset().load(DATA_PATH + '/train_external.tsd')
 test           = TimeSeriesDataset().load(DATA_PATH + '/test.tsd')
+test_full      = TimeSeriesDataset().load(DATA_PATH + '/test_full.tsd')
 
 labels_train_internal = load_pickle(DATA_PATH + '/labels_train_internal.pickle')
 labels_test           = load_pickle(DATA_PATH + '/labels_test.pickle')
@@ -248,15 +253,41 @@ if int_L_test < int_max_L:
     pad = np.full((int_test_np.shape[0], int_max_L - int_L_test, int_test_np.shape[2]), np.nan)
     int_test_np = np.concatenate([int_test_np, pad], axis=1)
 
-print()
-saits_1hr_internal = train_saits(int_train_np, seed=SEED, tag="saits_1hr_internal")
+saits_1hr_internal_path = os.path.join(SAITS_MODEL_DIR, 'saits_1hr_internal.pypots')
+saits_1hr_internal = SAITS(
+    n_steps=int_max_L,
+    n_features=int_train_np.shape[2],
+    device=DEVICE,
+    **SAITS_PARAMS,
+)
+if os.path.exists(saits_1hr_internal_path):
+    print(f"\nLoading pretrained saits_1hr_internal from {saits_1hr_internal_path}")
+    saits_1hr_internal.load(saits_1hr_internal_path)
+else:
+    print()
+    saits_1hr_internal = train_saits(int_train_np, seed=SEED, tag="saits_1hr_internal")
+    saits_1hr_internal.save(saits_1hr_internal_path)
+    print(f"Saved saits_1hr_internal to {saits_1hr_internal_path}")
 
 # Model 2: saits_1hr_external — trained on train_external (already at 1hr)
-ext_np   = train_external.data.numpy()          # [N_ext, L_ext, C]
+ext_np    = train_external.data.numpy()          # [N_ext, L_ext, C]
 ext_max_L = ext_np.shape[1]
 
-print()
-saits_1hr_external = train_saits(ext_np, seed=SEED, tag="saits_1hr_external")
+saits_1hr_external_path = os.path.join(SAITS_MODEL_DIR, 'saits_1hr_external.pypots')
+saits_1hr_external = SAITS(
+    n_steps=ext_max_L,
+    n_features=ext_np.shape[2],
+    device=DEVICE,
+    **SAITS_PARAMS,
+)
+if os.path.exists(saits_1hr_external_path):
+    print(f"\nLoading pretrained saits_1hr_external from {saits_1hr_external_path}")
+    saits_1hr_external.load(saits_1hr_external_path)
+else:
+    print()
+    saits_1hr_external = train_saits(ext_np, seed=SEED, tag="saits_1hr_external")
+    saits_1hr_external.save(saits_1hr_external_path)
+    print(f"Saved saits_1hr_external to {saits_1hr_external_path}")
 
 # ----------------------------------------------------------------------------
 # Step 2b — Produce imputed outputs
@@ -318,30 +349,53 @@ def find_top_k_external(patient_coarse_np, top_k=TOP_K):
 # ----------------------------------------------------------------------------
 # Step 2d — Naive fusion: 0.5 * internal + 0.5 * average(top-K external)
 # ----------------------------------------------------------------------------
-def fuse_patient(imputed_internal, imputed_ext_list, top_k_idx):
+def fuse_patient(imputed_internal, imputed_ext_list, top_k_idx, patient_coarse_np):
     """Fuse one patient's internal imputed trajectory with top-K external trajectories.
 
     imputed_internal:  [L_int, C] numpy array (fully imputed)
     imputed_ext_list:  list of [L_ext_i, C] numpy arrays (fully imputed external)
     top_k_idx:         list of indices into imputed_ext_list
+    patient_coarse_np: [L_coarse, C] original coarse (8hr) array with NaN for missing
 
+    Observed positions (non-NaN in coarse data) are preserved as-is.
+    Fusion is only applied at missing/interpolated positions.
     Returns fused array of shape [L_int, C].
     """
     L_int, C = imputed_internal.shape
     fused     = imputed_internal.copy()
 
+    # Build 1hr observed mask from coarse data: True = originally observed (non-NaN)
+    obs_mask_1hr = np.zeros(L_int, dtype=bool)
+    for t in range(patient_coarse_np.shape[0]):
+        t_1hr = t * DOWNSAMPLE_RATE
+        if t_1hr < L_int:
+            obs_mask_1hr[t_1hr] = True
+
+    # Restore original observed values (undo any SAITS distortion at observed positions)
+    for t in range(patient_coarse_np.shape[0]):
+        t_1hr = t * DOWNSAMPLE_RATE
+        if t_1hr >= L_int:
+            break
+        row = patient_coarse_np[t]
+        non_nan = ~np.isnan(row)
+        if non_nan.any():
+            fused[t_1hr, non_nan] = row[non_nan]
+
     if not top_k_idx:
         return fused
 
+    # Apply fusion only at missing/interpolated positions
     for t in range(L_int):
+        if obs_mask_1hr[t]:
+            continue   # preserve observed value
         ext_vals = []
         for ej in top_k_idx:
             ext_traj = imputed_ext_list[ej]
             if t < len(ext_traj):
                 ext_vals.append(ext_traj[t])   # [C]
         if ext_vals:
-            ext_mean     = np.mean(np.stack(ext_vals, axis=0), axis=0)  # [C]
-            fused[t]     = (1.0 - FUSION_WEIGHT) * imputed_internal[t] + FUSION_WEIGHT * ext_mean
+            ext_mean = np.mean(np.stack(ext_vals, axis=0), axis=0)  # [C]
+            fused[t] = (1.0 - FUSION_WEIGHT) * imputed_internal[t] + FUSION_WEIGHT * ext_mean
 
     return fused
 
@@ -367,13 +421,10 @@ for i, patient in enumerate(int_coarse_list):
     L_int_i           = int_L_train                # max-padded length used — use real length
     real_L            = train_internal_up.lengths[i]
     imputed_int_i     = imputed_internal_train_np[i, :real_L, :]  # [L_1hr_i, C]
-    fused_i           = fuse_patient(imputed_int_i, imputed_external_list, top_k_idx)
+    fused_i           = fuse_patient(imputed_int_i, imputed_external_list, top_k_idx, patient_coarse_np)
     fused_train_list.append(torch.tensor(fused_i, dtype=torch.float32))
     fused_train_lengths.append(real_L)
 
-# Save original 1hr upsampled test array before imputation for MSE computation
-# Observed positions = every DOWNSAMPLE_RATE-th step; NaN elsewhere.
-int_test_np_orig = int_test_np[:, :int_L_test, :].copy()   # [N_test, int_L_test, C]
 
 print(f"\nFusing test patients (N={len(test_coarse_list)})...")
 fused_test_list   = []
@@ -385,24 +436,22 @@ for i, patient in enumerate(test_coarse_list):
     top_k_idx, _      = find_top_k_external(patient_coarse_np)
     real_L            = test_up.lengths[i]
     imputed_int_i     = imputed_internal_test_np[i, :real_L, :]   # [L_1hr_i, C]
-    fused_i           = fuse_patient(imputed_int_i, imputed_external_list, top_k_idx)
+    fused_i           = fuse_patient(imputed_int_i, imputed_external_list, top_k_idx, patient_coarse_np)
     fused_test_list.append(torch.tensor(fused_i, dtype=torch.float32))
     fused_test_lengths.append(real_L)
 
-# Imputation MSE: compare fused 1hr test trajectories to original 8hr observations.
-# For each patient, original observations are at timestep indices [0, 8, 16, ...] in 1hr space.
+# Imputation MSE: compare fused 1hr test trajectories to test_full (true 1hr ground truth).
+# Mask out positions where test_full is NaN (genuinely missing even in full resolution).
+test_full_list = test_full.to_list()
 mse_vals = []
-for i, (orig_coarse, fused_1hr) in enumerate(zip(test_coarse_list, fused_test_list)):
-    orig_np  = orig_coarse.numpy()   # [L_coarse, C] — original 8hr values with NaN for missing
-    fused_np = fused_1hr.numpy()     # [L_1hr, C]    — final fused imputed trajectory
-    for t in range(orig_np.shape[0]):
-        t_1hr = t * DOWNSAMPLE_RATE
-        if t_1hr >= fused_np.shape[0]:
-            break
-        obs_mask = ~np.isnan(orig_np[t])
-        if obs_mask.any():
-            diff = orig_np[t, obs_mask] - fused_np[t_1hr, obs_mask]
-            mse_vals.extend((diff ** 2).tolist())
+for i, (fused_1hr, full_1hr) in enumerate(zip(fused_test_list, test_full_list)):
+    fused_np = fused_1hr.numpy()   # [L_1hr, C] — final fused imputed trajectory
+    full_np  = full_1hr.numpy()    # [L_full, C] — true 1hr ground truth
+    cmp_L    = min(fused_np.shape[0], full_np.shape[0])
+    obs_mask = ~np.isnan(full_np[:cmp_L])
+    if obs_mask.any():
+        diff = full_np[:cmp_L][obs_mask] - fused_np[:cmp_L][obs_mask]
+        mse_vals.extend((diff ** 2).tolist())
 imputation_mse = float(np.mean(mse_vals)) if mse_vals else float('nan')
 
 # Rebuild TimeSeriesDatasets from fused trajectories

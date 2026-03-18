@@ -68,13 +68,15 @@ SAITS_PARAMS = dict(
     batch_size=16,
 )
 
+DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
 print("=" * 60)
 print("Baseline 2: SAITS imputation at 1hr resolution (no external)")
 print("=" * 60)
 print(f"Seed:             {SEED}")
 print(f"Downsample rate:  {DOWNSAMPLE_RATE}hr")
 print(f"SAITS parameters: {SAITS_PARAMS}")
-print(f"Device:           {'cpu'}")
+print(f"Device:           {DEVICE}")
 print()
 
 np.random.seed(SEED)
@@ -200,7 +202,7 @@ saits_1hr_internal_path = os.path.join(SAITS_MODEL_DIR, 'saits_1hr_internal.pypo
 saits_1hr_internal = SAITS(
     n_steps=max_L,
     n_features=n_features,
-    device="cpu",
+    device=DEVICE,
     **SAITS_PARAMS,
 )
 if os.path.exists(saits_1hr_internal_path):

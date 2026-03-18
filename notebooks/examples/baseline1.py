@@ -31,6 +31,8 @@ class _Tee:
 
 _log_dir = os.path.join(os.path.dirname(__file__), '../../results')
 os.makedirs(_log_dir, exist_ok=True)
+SAITS_MODEL_DIR = os.path.join(_log_dir, 'saits_models')
+os.makedirs(SAITS_MODEL_DIR, exist_ok=True)
 _log_path = os.path.join(_log_dir, 'baseline1_output.txt')
 _log_file = open(_log_path, 'w')
 sys.stdout = _Tee(sys.__stdout__, _log_file)
@@ -65,12 +67,14 @@ SAITS_PARAMS = dict(
     batch_size=16,
 )
 
+DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
 print("=" * 60)
 print("Baseline 1: SAITS imputation at 8hr coarse-grained resolution")
 print("=" * 60)
 print(f"Seed:             {SEED}")
 print(f"SAITS parameters: {SAITS_PARAMS}")
-print(f"Device:           {'cpu'}")
+print(f"Device:           {DEVICE}")
 print()
 
 np.random.seed(SEED)
@@ -127,15 +131,21 @@ saits_val_masked = mcar(saits_val_ori, p=0.1)   # add 10% artificial masking for
 train_set = {"X": saits_train}
 val_set   = {"X": saits_val_masked, "X_ori": saits_val_ori}
 
-# Train saits_8hr on train_internal (NaN positions are the missing values)
-print("\nTraining saits_8hr on train_internal...")
+saits_8hr_path = os.path.join(SAITS_MODEL_DIR, 'saits_8hr_internal.pypots')
 saits_8hr = SAITS(
     n_steps=max_L,
     n_features=n_features,
-    device="cpu",
+    device=DEVICE,
     **SAITS_PARAMS,
 )
-saits_8hr.fit(train_set, val_set)
+if os.path.exists(saits_8hr_path):
+    print(f"\nLoading pretrained saits_8hr from {saits_8hr_path}")
+    saits_8hr.load(saits_8hr_path)
+else:
+    print("\nTraining saits_8hr on train_internal...")
+    saits_8hr.fit(train_set, val_set)
+    saits_8hr.save(saits_8hr_path)
+    print(f"Saved saits_8hr to {saits_8hr_path}")
 
 # Impute train_internal with saits_8hr
 print("Imputing train_internal with saits_8hr...")
