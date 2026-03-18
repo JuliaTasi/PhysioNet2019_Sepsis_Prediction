@@ -33,6 +33,8 @@ class _Tee:
 
 _log_dir = os.path.join(os.path.dirname(__file__), '../../results')
 os.makedirs(_log_dir, exist_ok=True)
+SAITS_MODEL_DIR = os.path.join(_log_dir, 'saits_models')
+os.makedirs(SAITS_MODEL_DIR, exist_ok=True)
 _log_path = os.path.join(_log_dir, 'baseline2_output.txt')
 _log_file = open(_log_path, 'w')
 sys.stdout = _Tee(sys.__stdout__, _log_file)
@@ -136,12 +138,14 @@ def upsample_labels(labels, original_lengths, rate=DOWNSAMPLE_RATE):
 # =============================================================================
 train_internal = TimeSeriesDataset().load(DATA_PATH + '/train_internal.tsd')
 test           = TimeSeriesDataset().load(DATA_PATH + '/test.tsd')
+test_full      = TimeSeriesDataset().load(DATA_PATH + '/test_full.tsd')
 
 labels_train_internal = load_pickle(DATA_PATH + '/labels_train_internal.pickle')
 labels_test           = load_pickle(DATA_PATH + '/labels_test.pickle')
 
 print(f"Train internal: {len(train_internal)} patients")
 print(f"Test:           {len(test)} patients")
+print(f"Test full (1hr): {len(test_full)} patients")
 
 # Save original lengths (coarse) for label expansion
 orig_lengths_train = list(train_internal.lengths)
@@ -179,8 +183,6 @@ if test_L < max_L:
     pad = np.full((test_np.shape[0], max_L - test_L, n_features), np.nan)
     test_np = np.concatenate([test_np, pad], axis=1)
 
-# Save original 1hr upsampled test array (NaN = missing/inserted) for imputation MSE
-test_np_orig = test_np.copy()
 
 print(f"\nSequence length after padding: {max_L}")
 print(f"Number of features:            {n_features}")
@@ -193,37 +195,54 @@ saits_val_masked = mcar(saits_val_ori, p=0.1)
 train_set = {"X": saits_train}
 val_set   = {"X": saits_val_masked, "X_ori": saits_val_ori}
 
-# Train saits_1hr_internal on upsampled train_internal
-print("\nTraining saits_1hr_internal on upsampled train_internal...")
+# Train saits_1hr_internal on upsampled train_internal (or load pretrained)
+saits_1hr_internal_path = os.path.join(SAITS_MODEL_DIR, 'saits_1hr_internal.pypots')
 saits_1hr_internal = SAITS(
     n_steps=max_L,
     n_features=n_features,
     device="cpu",
     **SAITS_PARAMS,
 )
-saits_1hr_internal.fit(train_set, val_set)
+if os.path.exists(saits_1hr_internal_path):
+    print(f"\nLoading pretrained saits_1hr_internal from {saits_1hr_internal_path}")
+    saits_1hr_internal.load(saits_1hr_internal_path)
+else:
+    print("\nTraining saits_1hr_internal on upsampled train_internal...")
+    saits_1hr_internal.fit(train_set, val_set)
+    saits_1hr_internal.save(saits_1hr_internal_path)
+    print(f"Saved saits_1hr_internal to {saits_1hr_internal_path}")
 
-# Step 2.4 — Impute both splits
+# Step 2.4 — Impute both splits (batched to avoid OOM)
+def batch_impute(model, X, batch_size=32):
+    """Impute in chunks to avoid OOM on large arrays."""
+    results = []
+    for start in range(0, len(X), batch_size):
+        chunk = X[start:start + batch_size]
+        out = model.impute({"X": chunk})
+        if isinstance(out, dict):
+            out = out['imputation']
+        results.append(out)
+    return np.concatenate(results, axis=0)
+
 print("Imputing upsampled train_internal...")
-train_imputed = saits_1hr_internal.impute({"X": train_np})
-if isinstance(train_imputed, dict):
-    train_imputed = train_imputed['imputation']
+train_imputed = batch_impute(saits_1hr_internal, train_np)
 train_up.data = torch.tensor(train_imputed[:, :train_L, :], dtype=torch.float32)
 
 print("Imputing upsampled test...")
-test_imputed = saits_1hr_internal.impute({"X": test_np})
-if isinstance(test_imputed, dict):
-    test_imputed = test_imputed['imputation']
+test_imputed = batch_impute(saits_1hr_internal, test_np)
 test_imputed_crop = test_imputed[:, :test_L, :]    # [N_test, test_L, C]
 test_up.data = torch.tensor(test_imputed_crop, dtype=torch.float32)
 
-# Imputation MSE: MSE at originally observed (non-NaN) positions in the 1hr test set.
-# Observed positions = original 8hr timestamps (every DOWNSAMPLE_RATE-th step);
-# inserted intermediate NaN rows are excluded automatically by the mask.
-test_orig_crop = test_np_orig[:, :test_L, :]       # [N_test, test_L, C]
-obs_mask = ~np.isnan(test_orig_crop)
+# Imputation MSE: compare imputed 1hr test against test_full (true 1hr ground truth).
+# Mask out positions where test_full is NaN (genuinely missing even in full resolution).
+test_full_np = test_full.data.numpy()   # [N_test, test_full_L, C]
+full_L = test_full_np.shape[1]
+cmp_L  = min(test_L, full_L)           # align lengths
+test_full_cmp    = test_full_np[:, :cmp_L, :]
+test_imputed_cmp = test_imputed_crop[:, :cmp_L, :]
+obs_mask = ~np.isnan(test_full_cmp)
 imputation_mse = float(np.mean(
-    (test_orig_crop[obs_mask] - test_imputed_crop[obs_mask]) ** 2
+    (test_full_cmp[obs_mask] - test_imputed_cmp[obs_mask]) ** 2
 ))
 
 # =============================================================================
